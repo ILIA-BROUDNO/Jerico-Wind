@@ -5,7 +5,7 @@
 
 const WEATHERLINK_URL = 'https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce';
 const CACHE_TTL_SECONDS = 0;
-const PURGE_DAYS = 7;
+const PURGE_DAYS = 60;
 
 // --- Cron Handler: fetch WeatherLink, store in D1 ---
 async function handleScheduled(env) {
@@ -50,18 +50,78 @@ async function handleAPI(request, env, ctx) {
   let response;
 
   if (url.pathname === '/api/readings') {
-    const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '6', 10), 1), 168);
-    const since = Math.floor(Date.now() / 1000) - hours * 3600;
+    let since, until;
+    if (url.searchParams.has('min') && url.searchParams.has('max')) {
+      since = parseInt(url.searchParams.get('min'), 10);
+      until = parseInt(url.searchParams.get('max'), 10);
+      const oldest = Math.floor(Date.now() / 1000) - PURGE_DAYS * 86400;
+      if (since < oldest) since = oldest;
+    } else {
+      const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '6', 10), 1), PURGE_DAYS * 24);
+      since = Math.floor(Date.now() / 1000) - hours * 3600;
+      until = Math.floor(Date.now() / 1000);
+    }
 
     const { results } = await env.DB.prepare(
-      'SELECT station_time, wind_speed, wind_gust, wind_direction, temperature, barometer, gust_at FROM readings WHERE station_time > ? ORDER BY station_time ASC'
-    ).bind(since).all();
+      'SELECT station_time, wind_speed, wind_direction, temperature, barometer FROM readings WHERE station_time > ? AND station_time <= ? ORDER BY station_time ASC'
+    ).bind(since, until).all();
 
     response = jsonResponse(results);
 
+  } else if (url.pathname === '/api/jsca-txt') {
+    // Proxy the JSCA 2-day data dump and parse it
+    const txtResp = await fetch('https://jsca.bc.ca/main/downld02.txt', {
+      headers: { 'User-Agent': 'JerichoWindMonitor/1.0' },
+    });
+    if (!txtResp.ok) return jsonResponse({ error: 'Failed to fetch JSCA data' }, 502);
+    const txt = await txtResp.text();
+    const lines = txt.split('\n');
+    const readings = [];
+    for (const line of lines) {
+      const m = line.match(/^\s*(\d{1,2}\/\d{1,2}\/\d{2})\s+(\d{1,2}:\d{2}[ap])\s+/);
+      if (!m) continue;
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 16) continue;
+      const dateStr = parts[0];
+      const timeStr = parts[1];
+      // Parse date: M/D/YY
+      const dp = dateStr.split('/');
+      const year = 2000 + parseInt(dp[2]);
+      const month = parseInt(dp[0]) - 1;
+      const day = parseInt(dp[1]);
+      // Parse time: h:mma/p
+      const tm = timeStr.match(/(\d{1,2}):(\d{2})([ap])/);
+      if (!tm) continue;
+      let hour = parseInt(tm[1]);
+      const min = parseInt(tm[2]);
+      const ampm = tm[3];
+      if (ampm === 'p' && hour !== 12) hour += 12;
+      if (ampm === 'a' && hour === 12) hour = 0;
+      // txt times are PDT (UTC-7), construct UTC timestamp
+      const dt = new Date(Date.UTC(year, month, day, hour + 7, min));
+      const ts = Math.floor(dt.getTime() / 1000);
+      const windSpeed = parseFloat(parts[7]) || 0;
+      const windDir = parts[8];
+      const hiSpeed = parseFloat(parts[10]) || 0;
+      const hiDir = parts[11];
+      // Convert compass to degrees
+      function compassToDeg(c) {
+        var map = {N:0,NNE:22,NE:45,ENE:67,E:90,ESE:112,SE:135,SSE:157,S:180,SSW:202,SW:225,WSW:247,W:270,WNW:292,NW:315,NNW:337};
+        return map[c] != null ? map[c] : null;
+      }
+      readings.push({
+        station_time: ts,
+        wind_speed: windSpeed,
+        wind_gust: hiSpeed,
+        wind_direction: compassToDeg(windDir),
+        gust_direction: compassToDeg(hiDir)
+      });
+    }
+    response = jsonResponse(readings);
+
   } else if (url.pathname === '/api/current') {
     const { results } = await env.DB.prepare(
-      'SELECT station_time, wind_speed, wind_gust, wind_direction, temperature, barometer, gust_at FROM readings ORDER BY station_time DESC LIMIT 1'
+      'SELECT station_time, wind_speed, wind_direction, temperature, barometer FROM readings ORDER BY station_time DESC LIMIT 1'
     ).all();
 
     response = jsonResponse(results[0] || null);
@@ -238,6 +298,21 @@ const HTML_PAGE = `<!DOCTYPE html>
         <button data-hours="24">24 Hours</button>
         <button data-hours="48">48 Hours</button>
         <button data-hours="168">7 Days</button>
+        <button id="customBtn">Custom</button>
+        <div class="toggle-container" style="display:inline-flex; align-items:center; gap:6px; margin-left:10px; font-size:0.8rem; color:#90a4ae;">
+            <span>1min</span>
+            <div id="sourceToggle" class="toggle-switch" style="width:36px; height:20px; background:#2a3f50; border-radius:10px; position:relative; cursor:pointer; transition:background 0.2s;">
+                <div class="toggle-knob" style="width:16px; height:16px; background:#e0e0e0; border-radius:50%; position:absolute; top:2px; left:2px; transition:left 0.2s;"></div>
+            </div>
+            <span>30min</span>
+        </div>
+    </div>
+    <div id="customRange" style="display:none; margin-bottom:20px; background:#1a2733; border:1px solid #2a3f50; border-radius:10px; padding:15px;">
+        <div style="display:flex; gap:15px; flex-wrap:wrap; align-items:center;">
+            <label style="color:#90a4ae; font-size:0.85rem;">From: <input type="datetime-local" id="rangeFrom" style="background:#0f1923; color:#e0e0e0; border:1px solid #2a3f50; border-radius:4px; padding:4px 8px;"></label>
+            <label style="color:#90a4ae; font-size:0.85rem;">To: <input type="datetime-local" id="rangeTo" style="background:#0f1923; color:#e0e0e0; border:1px solid #2a3f50; border-radius:4px; padding:4px 8px;"></label>
+            <button id="customGo" style="background:#4fc3f7; color:#0f1923; border:none; border-radius:6px; padding:8px 16px; cursor:pointer; font-weight:600;">Go</button>
+        </div>
     </div>
     <div class="chart-container">
         <h2>Wind Speed &amp; Gust (knots) with Direction Arrows</h2>
@@ -258,7 +333,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         var windChart;
         var directionChart;
         var windDirections = [];
-        var gustEvents = [];
+        var gustDirections = [];
 
         function drawArrow(ctx, x, y, angle, len, color) {
             ctx.save();
@@ -301,14 +376,15 @@ const HTML_PAGE = `<!DOCTYPE html>
                     }
                 }
 
-                // Red gust event arrows at actual gust timestamps
-                if (gustEvents.length) {
-                    for (var j = 0; j < gustEvents.length; j++) {
-                        var ge = gustEvents[j];
-                        if (ge.dir == null) continue;
-                        var gx = xScale.getPixelForValue(ge.x);
-                        var gy = yScale.getPixelForValue(ge.y);
-                        var gangle = (ge.dir + 180) * Math.PI / 180;
+                // Red gust direction arrows (JSCA only, on gust line)
+                if (useJscaSource && gustDirections.length && gustData.length) {
+                    var gStep = Math.max(1, Math.floor(gustData.length / maxArrows));
+                    for (var j = 0; j < gustData.length; j += gStep) {
+                        var gdir = gustDirections[j];
+                        if (gdir == null) continue;
+                        var gx = xScale.getPixelForValue(gustData[j].x);
+                        var gy = yScale.getPixelForValue(gustData[j].y);
+                        var gangle = (gdir + 180) * Math.PI / 180;
                         drawArrow(ctx, gx, gy, gangle, 14, 'rgba(255,112,67,0.9)');
                     }
                 }
@@ -328,8 +404,27 @@ const HTML_PAGE = `<!DOCTYPE html>
             document.getElementById('currentDirection').textContent =
                 reading.wind_direction != null ? degreesToCompass(reading.wind_direction) + ' (' + reading.wind_direction + '\\u00B0)' : '--';
             document.getElementById('currentTemp').textContent = reading.temperature != null ? reading.temperature.toFixed(1) : '--';
-            // document.getElementById('currentBaro').textContent = reading.barometer != null ? reading.barometer.toFixed(1) : '--';
             document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date(reading.station_time * 1000).toLocaleTimeString();
+            document.getElementById('statusIndicator').textContent = '\\u25CF ';
+            document.getElementById('statusIndicator').className = 'live';
+        }
+
+        function updateCurrentDisplayD1(readings) {
+            var now = readings[readings.length - 1].station_time;
+            var thirtyMinAgo = now - 1800;
+            var recent = readings.filter(function(r) { return r.station_time > thirtyMinAgo; });
+            if (!recent.length) recent = [readings[readings.length - 1]];
+            var avgWind = recent.reduce(function(s, r) { return s + r.wind_speed; }, 0) / recent.length;
+            var maxWind = Math.max.apply(null, recent.map(function(r) { return r.wind_speed; }));
+            var dirs = recent.filter(function(r) { return r.wind_direction != null; }).map(function(r) { return r.wind_direction; });
+            var avgDir = dirs.length ? Math.round(dirs.reduce(function(s, d) { return s + d; }, 0) / dirs.length) : null;
+            var lastReading = readings[readings.length - 1];
+            document.getElementById('currentWind').textContent = avgWind.toFixed(1);
+            document.getElementById('currentGust').textContent = maxWind.toFixed(1);
+            document.getElementById('currentDirection').textContent =
+                avgDir != null ? degreesToCompass(avgDir) + ' (' + avgDir + '\\u00B0)' : '--';
+            document.getElementById('currentTemp').textContent = lastReading.temperature != null ? lastReading.temperature.toFixed(1) : '--';
+            document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date(lastReading.station_time * 1000).toLocaleTimeString();
             document.getElementById('statusIndicator').textContent = '\\u25CF ';
             document.getElementById('statusIndicator').className = 'live';
         }
@@ -340,15 +435,43 @@ const HTML_PAGE = `<!DOCTYPE html>
             document.getElementById('lastUpdate').textContent = msg;
         }
 
+        var customRange = null; // {min, max} in unix seconds
+        var useJscaSource = false;
+
         function fetchData() {
-            fetch('/api/readings?hours=' + displayHours)
+            var url;
+            if (useJscaSource) {
+                url = '/api/jsca-txt';
+            } else if (customRange) {
+                url = '/api/readings?min=' + customRange.min + '&max=' + customRange.max;
+            } else {
+                url = '/api/readings?hours=' + displayHours;
+            }
+            fetch(url)
                 .then(function(resp) {
                     if (!resp.ok) throw new Error('HTTP ' + resp.status);
                     return resp.json();
                 })
                 .then(function(readings) {
+                    // If JSCA source, filter by time range
+                    if (useJscaSource && readings.length) {
+                        var now = Math.floor(Date.now() / 1000);
+                        var minT, maxT;
+                        if (customRange) {
+                            minT = customRange.min;
+                            maxT = customRange.max;
+                        } else {
+                            minT = now - displayHours * 3600;
+                            maxT = now;
+                        }
+                        readings = readings.filter(function(r) { return r.station_time > minT && r.station_time <= maxT; });
+                    }
                     if (readings.length > 0) {
-                        updateCurrentDisplay(readings[readings.length - 1]);
+                        if (useJscaSource) {
+                            updateCurrentDisplay(readings[readings.length - 1]);
+                        } else {
+                            updateCurrentDisplayD1(readings);
+                        }
                     }
                     updateCharts(readings);
                 })
@@ -383,7 +506,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                             borderColor: '#ff7043',
                             backgroundColor: 'rgba(255,112,67,0.05)',
                             fill: true,
-                            stepped: true,
+                            tension: 0,
                             pointRadius: 0,
                             borderWidth: 1.5,
                             borderDash: [4, 2],
@@ -414,9 +537,20 @@ const HTML_PAGE = `<!DOCTYPE html>
                     scales: {
                         x: {
                             type: 'time',
-                            time: { tooltipFormat: 'yyyy-MM-dd HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm' } },
+                            time: { tooltipFormat: 'yyyy-MM-dd HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'MMM d' } },
                             grid: { color: gridColor },
-                            ticks: { color: tickColor, maxTicksLimit: 12 }
+                            ticks: {
+                                color: tickColor, maxTicksLimit: 12,
+                                callback: function(value, index, ticks) {
+                                    var d = new Date(ticks[index].value);
+                                    var timeStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+                                    if (displayHours > 24 || customRange) {
+                                        var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                                        return [timeStr, months[d.getMonth()] + ' ' + d.getDate()];
+                                    }
+                                    return timeStr;
+                                }
+                            }
                         },
                         y: {
                             beginAtZero: true,
@@ -460,9 +594,20 @@ const HTML_PAGE = `<!DOCTYPE html>
                     scales: {
                         x: {
                             type: 'time',
-                            time: { tooltipFormat: 'yyyy-MM-dd HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm' } },
+                            time: { tooltipFormat: 'yyyy-MM-dd HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'MMM d' } },
                             grid: { color: gridColor },
-                            ticks: { color: tickColor, maxTicksLimit: 12 }
+                            ticks: {
+                                color: tickColor, maxTicksLimit: 12,
+                                callback: function(value, index, ticks) {
+                                    var d = new Date(ticks[index].value);
+                                    var timeStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+                                    if (displayHours > 24 || customRange) {
+                                        var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                                        return [timeStr, months[d.getMonth()] + ' ' + d.getDate()];
+                                    }
+                                    return timeStr;
+                                }
+                            }
                         },
                         y: {
                             min: 0, max: 360,
@@ -483,21 +628,14 @@ const HTML_PAGE = `<!DOCTYPE html>
 
         function updateCharts(readings) {
             windChart.data.datasets[0].data = readings.map(function(d) { return { x: d.station_time * 1000, y: d.wind_speed }; });
-            windChart.data.datasets[1].data = readings.map(function(d) { return { x: d.station_time * 1000, y: d.wind_gust }; });
+            // Only show gust line for JSCA source
+            if (useJscaSource) {
+                windChart.data.datasets[1].data = readings.map(function(d) { return { x: d.station_time * 1000, y: d.wind_gust }; });
+            } else {
+                windChart.data.datasets[1].data = [];
+            }
             windDirections = readings.map(function(d) { return d.wind_direction; });
-            // Collect unique gust events with their actual timestamps
-            var seenGustAt = {};
-            gustEvents = [];
-            readings.forEach(function(d) {
-                if (d.gust_at != null && !seenGustAt[d.gust_at]) {
-                    seenGustAt[d.gust_at] = true;
-                    gustEvents.push({
-                        x: d.gust_at * 1000,
-                        y: d.wind_gust,
-                        dir: d.wind_direction
-                    });
-                }
-            });
+            gustDirections = readings.map(function(d) { return d.gust_direction != null ? d.gust_direction : d.wind_direction; });
             windChart.update('none');
 
             directionChart.data.datasets[0].data = readings.filter(function(d) { return d.wind_direction != null; })
@@ -505,13 +643,65 @@ const HTML_PAGE = `<!DOCTYPE html>
             directionChart.update('none');
         }
 
-        document.querySelectorAll('.controls button').forEach(function(btn) {
+        document.querySelectorAll('.controls button[data-hours]').forEach(function(btn) {
             btn.addEventListener('click', function() {
                 document.querySelectorAll('.controls button').forEach(function(b) { b.classList.remove('active'); });
                 this.classList.add('active');
                 displayHours = parseInt(this.dataset.hours);
+                customRange = null;
+                document.getElementById('customRange').style.display = 'none';
                 fetchData();
             });
+        });
+
+        // Custom range controls
+        var customBtn = document.getElementById('customBtn');
+        var customPanel = document.getElementById('customRange');
+        var rangeFrom = document.getElementById('rangeFrom');
+        var rangeTo = document.getElementById('rangeTo');
+        var customGo = document.getElementById('customGo');
+
+        // Set min/max attributes (7 days ago to now)
+        var now = new Date();
+        var sixtyDaysAgo = new Date(now.getTime() - 60 * 86400000);
+        function toLocalISO(d) { return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
+        rangeFrom.min = toLocalISO(sixtyDaysAgo);
+        rangeFrom.max = toLocalISO(now);
+        rangeTo.min = toLocalISO(sixtyDaysAgo);
+        rangeTo.max = toLocalISO(now);
+        rangeTo.value = toLocalISO(now);
+        rangeFrom.value = toLocalISO(new Date(now.getTime() - 3600000));
+
+        customBtn.addEventListener('click', function() {
+            var showing = customPanel.style.display !== 'none';
+            customPanel.style.display = showing ? 'none' : 'block';
+            if (!showing) {
+                document.querySelectorAll('.controls button').forEach(function(b) { b.classList.remove('active'); });
+                customBtn.classList.add('active');
+            }
+        });
+
+        customGo.addEventListener('click', function() {
+            var from = new Date(rangeFrom.value);
+            var to = new Date(rangeTo.value);
+            if (isNaN(from) || isNaN(to) || from >= to) { alert('Invalid range'); return; }
+            customRange = { min: Math.floor(from.getTime() / 1000), max: Math.floor(to.getTime() / 1000) };
+            fetchData();
+        });
+
+        // Source toggle (D1 vs JSCA txt)
+        var toggleEl = document.getElementById('sourceToggle');
+        var toggleKnob = toggleEl.querySelector('.toggle-knob');
+        toggleEl.addEventListener('click', function() {
+            useJscaSource = !useJscaSource;
+            if (useJscaSource) {
+                toggleEl.style.background = '#4fc3f7';
+                toggleKnob.style.left = '18px';
+            } else {
+                toggleEl.style.background = '#2a3f50';
+                toggleKnob.style.left = '2px';
+            }
+            fetchData();
         });
 
         createCharts();
