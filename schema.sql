@@ -8,3 +8,13 @@ CREATE TABLE IF NOT EXISTS readings (
   barometer REAL,
   gust_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS jsc_readings (
+  station_time INTEGER PRIMARY KEY,
+  wind_speed REAL,
+  wind_gust REAL,
+  wind_direction INTEGER,
+  gust_direction INTEGER,
+  temperature REAL,
+  rain_rate REAL
+);
