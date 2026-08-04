@@ -5,7 +5,6 @@
 
 const WEATHERLINK_URL = 'https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce';
 const JSCA_TXT_URL = 'https://jsca.bc.ca/main/downld02.txt';
-const CACHE_TTL_SECONDS = 0;
 const PURGE_DAYS = 60;
 
 async function handleScheduled(event, env) {
@@ -94,8 +93,6 @@ async function handleJscScheduled(env) {
 // --- API Handler ---
 async function handleAPI(request, env, ctx) {
   const url = new URL(request.url);
-  const cacheKey = new Request(url.toString(), request);
-  const cache = caches.default;
 
   let response;
 
@@ -118,32 +115,39 @@ async function handleAPI(request, env, ctx) {
 
     response = jsonResponse(url.searchParams.get('summary') === '30' ? summarizeReadings(results, 1800) : results);
 
-    } else if (url.pathname === '/api/jsca-readings') {
-        let since, until;
-        if (url.searchParams.has('min') && url.searchParams.has('max')) {
-            since = parseInt(url.searchParams.get('min'), 10);
-            until = parseInt(url.searchParams.get('max'), 10);
-            const oldest = Math.floor(Date.now() / 1000) - PURGE_DAYS * 86400;
-            if (since < oldest) since = oldest;
-        } else {
-            const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '6', 10), 1), PURGE_DAYS * 24);
-            since = Math.floor(Date.now() / 1000) - hours * 3600;
-            until = Math.floor(Date.now() / 1000);
-        }
-
-        const { results } = await env.DB.prepare(
-            'SELECT station_time, wind_speed, wind_direction, wind_gust, gust_direction, temperature, rain_rate FROM jsc_readings WHERE station_time > ? AND station_time <= ? ORDER BY station_time ASC'
-        ).bind(since, until).all();
-
-        response = jsonResponse(results);
-
   } else if (url.pathname === '/api/jsca-txt') {
-    // Proxy the JSCA 2-day data dump and parse it
+    let since, until;
+    if (url.searchParams.has('min') && url.searchParams.has('max')) {
+      since = parseInt(url.searchParams.get('min'), 10);
+      until = parseInt(url.searchParams.get('max'), 10);
+      const oldest = Math.floor(Date.now() / 1000) - PURGE_DAYS * 86400;
+      if (since < oldest) since = oldest;
+    } else {
+      const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '6', 10), 1), PURGE_DAYS * 24);
+      since = Math.floor(Date.now() / 1000) - hours * 3600;
+      until = Math.floor(Date.now() / 1000);
+    }
+
+    // Serve from the live 2-day text dump first. It's only a rolling window,
+    // so for anything older we fall back to the D1 archive that the cron job
+    // has been building from the same source.
     const txtResp = await fetch(JSCA_TXT_URL, {
       headers: { 'User-Agent': 'JerichoWindMonitor/1.0' },
     });
-    if (!txtResp.ok) return jsonResponse({ error: 'Failed to fetch JSCA data' }, 502);
-    response = jsonResponse(parseJscReadings(await txtResp.text()));
+    const txtReadings = txtResp.ok
+      ? parseJscReadings(await txtResp.text()).filter((r) => r.station_time > since && r.station_time <= until)
+      : [];
+
+    const earliestTxt = txtReadings.length ? txtReadings[0].station_time : until;
+    let combined = txtReadings;
+    if (earliestTxt > since) {
+      const { results } = await env.DB.prepare(
+        'SELECT station_time, wind_speed, wind_direction, wind_gust, gust_direction, temperature, rain_rate FROM jsc_readings WHERE station_time > ? AND station_time < ? ORDER BY station_time ASC'
+      ).bind(since, earliestTxt).all();
+      combined = results.concat(txtReadings);
+    }
+
+    response = jsonResponse(combined);
 
   } else if (url.pathname === '/api/current') {
     const { results } = await env.DB.prepare(
@@ -620,10 +624,9 @@ const HTML_PAGE = `<!DOCTYPE html>
         <button data-hours="168">7 Days</button>
         <button id="customBtn">Custom</button>
         <div id="sourceSelector" class="source-selector" role="radiogroup" aria-label="Data source">
+            <label><input type="radio" name="sourceMode" value="jsc" autocomplete="off"><span>jsc</span></label>
             <label><input type="radio" name="sourceMode" value="raw" checked autocomplete="off"><span>raw</span></label>
             <label><input type="radio" name="sourceMode" value="avg" autocomplete="off"><span>avg</span></label>
-            <label><input type="radio" name="sourceMode" value="jsc" autocomplete="off"><span>jsc</span></label>
-            <label><input type="radio" name="sourceMode" value="jsca" autocomplete="off"><span>jsca</span></label>
         </div>
     </div>
     <div id="customRange" style="display:none; margin-bottom:20px; background:#1a2733; border:1px solid #2a3f50; border-radius:10px; padding:15px;">
@@ -672,7 +675,6 @@ const HTML_PAGE = `<!DOCTYPE html>
     </div>
     <script>
     (function() {
-        var POLL_INTERVAL_MS = 60 * 1000; // kept for reference only
         var displayHours = 1;
         var windChart;
         var directionChart;
@@ -787,7 +789,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                         var gangle = (gdir + 180) * Math.PI / 180;
                         drawArrow(ctx, gx, gy, gangle, 14, 'rgba(255,112,67,0.9)');
 
-                        if (sourceMode === 'jsc' || sourceMode === 'jsca' || sourceMode === 'avg') {
+                        if (sourceMode === 'jsc' || sourceMode === 'avg') {
                             var gustVal = gustData[j].y;
                             var gRain = gustRainRates[j];
                             var rainLevel = rainIntensityLevel(gRain);
@@ -839,29 +841,6 @@ const HTML_PAGE = `<!DOCTYPE html>
             document.getElementById('statusIndicator').className = 'live';
         }
 
-        function updateCurrentDisplayD1(readings) {
-            var now = readings[readings.length - 1].station_time;
-            var thirtyMinAgo = now - 1800;
-            var recent = readings.filter(function(r) { return r.station_time > thirtyMinAgo; });
-            if (!recent.length) recent = [readings[readings.length - 1]];
-            var avgWind = recent.reduce(function(s, r) { return s + r.wind_speed; }, 0) / recent.length;
-            var maxWind = Math.max.apply(null, recent.map(function(r) { return r.wind_speed; }));
-            var gusts = recent.filter(function(r) { return r.wind_gust != null; }).map(function(r) { return r.wind_gust; });
-            var maxGust = gusts.length ? Math.max.apply(null, gusts) : null;
-            var displayedGust = maxGust != null ? Math.max(maxWind, maxGust) : maxWind;
-            var dirs = recent.filter(function(r) { return r.wind_direction != null; }).map(function(r) { return r.wind_direction; });
-            var avgDir = dirs.length ? Math.round(dirs.reduce(function(s, d) { return s + d; }, 0) / dirs.length) : null;
-            var lastReading = readings[readings.length - 1];
-            document.getElementById('currentWind').textContent = avgWind.toFixed(1);
-            document.getElementById('currentGust').textContent = displayedGust.toFixed(1);
-            document.getElementById('currentDirection').textContent =
-                avgDir != null ? degreesToCompass(avgDir) + ' (' + avgDir + '\\u00B0)' : '--';
-            document.getElementById('currentTemp').textContent = lastReading.temperature != null ? lastReading.temperature.toFixed(1) : '--';
-            document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date(lastReading.station_time * 1000).toLocaleTimeString();
-            document.getElementById('statusIndicator').textContent = '\\u25CF ';
-            document.getElementById('statusIndicator').className = 'live';
-        }
-
         function showError(msg) {
             document.getElementById('statusIndicator').textContent = '\\u25CF ';
             document.getElementById('statusIndicator').className = 'error';
@@ -874,12 +853,10 @@ const HTML_PAGE = `<!DOCTYPE html>
         function fetchData() {
             var url;
             if (sourceMode === 'jsc') {
-                url = '/api/jsca-txt';
-            } else if (sourceMode === 'jsca') {
                 if (customRange) {
-                    url = '/api/jsca-readings?min=' + customRange.min + '&max=' + customRange.max;
+                    url = '/api/jsca-txt?min=' + customRange.min + '&max=' + customRange.max;
                 } else {
-                    url = '/api/jsca-readings?hours=' + displayHours;
+                    url = '/api/jsca-txt?hours=' + displayHours;
                 }
             } else if (customRange) {
                 url = '/api/readings?min=' + customRange.min + '&max=' + customRange.max;
@@ -895,26 +872,8 @@ const HTML_PAGE = `<!DOCTYPE html>
                     return resp.json();
                 })
                 .then(function(readings) {
-                    // If JSCA source, filter by time range
-                    if (sourceMode === 'jsc' && readings.length) {
-                        var now = Math.floor(Date.now() / 1000);
-                        var minT, maxT;
-                        if (customRange) {
-                            minT = customRange.min;
-                            maxT = customRange.max;
-                        } else {
-                            minT = now - displayHours * 3600;
-                            maxT = now;
-                        }
-                        readings = readings.filter(function(r) { return r.station_time > minT && r.station_time <= maxT; });
-                    }
                     if (readings.length > 0) {
                         updateCurrentDisplay(readings[readings.length - 1]);
-                        //if (sourceMode === 'raw') {
-                        //    updateCurrentDisplayD1(readings);
-                        //} else {
-                        //    updateCurrentDisplay(readings[readings.length - 1]);
-                        //}
                     }
                     updateCharts(readings);
                 })
