@@ -666,7 +666,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
     </div>
     <div class="data-info">
-        Data Sources Wind: <a href="https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce" target="_blank" rel="noopener">WeatherLink API</a>, Jericho Sailing Centre — 1-min data.
+        Data Sources:: Wind: <a href="https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce" target="_blank" rel="noopener">WeatherLink API</a>, Jericho Sailing Centre — 1-min data.
         JSCA: <a href="https://jsca.bc.ca/main/downld02.txt" target="_blank" rel="noopener">downld02.txt</a> — 30-min gust/rain feed.
         Tide: <a href="https://api-iwls.dfo-mpo.gc.ca/api/v1/stations" target="_blank" rel="noopener">CHS/DFO IWLS API</a>, Point Atkinson (07795).
     </div>
