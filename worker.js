@@ -157,7 +157,7 @@ async function handleAPI(request, env, ctx) {
     response = jsonResponse(results[0] || null);
 
   } else if (url.pathname === '/api/tides') {
-    const tide = await fetchTideData();
+    const tide = await fetchTideDataCached(ctx);
     response = tide ? jsonResponse(tide) : jsonResponse({ error: 'Tide data unavailable' }, 502);
 
   } else {
@@ -185,9 +185,72 @@ async function fetchTideSeries(code, fromDate, toDate, resolution) {
   }
 }
 
-async function fetchTideData() {
+// Fetches the 48-hour prediction curve, cached at the edge for 6 hours.
+// Predictions are deterministic (same values for the same time range no
+// matter who asks), so this is safe to cache aggressively and cuts out the
+// heaviest of the three CHS calls for almost all requests.
+async function fetchTideCurve(now, ctx) {
+  const bucketMs = 6 * 60 * 60 * 1000;
+  const bucketStart = new Date(Math.floor(now.getTime() / bucketMs) * bucketMs);
+  const cache = caches.default;
+  const cacheKey = new Request(`https://tide-cache.internal/curve?bucket=${bucketStart.toISOString()}`);
+
+  const cached = await cache.match(cacheKey);
+  if (cached) return await cached.json();
+
+  // Fetch wide enough to cover the whole 6h bucket plus the -6h/+42h range
+  // we need relative to "now" at any point within that bucket.
+  const curveFrom = new Date(bucketStart.getTime() - 6 * 60 * 60 * 1000);
+  const curveTo = new Date(bucketStart.getTime() + bucketMs + 42 * 60 * 60 * 1000);
+  const curveData = await fetchTideSeries('wlp', curveFrom, curveTo, 'FIFTEEN_MINUTES');
+  const predictions = curveData.map((pt) => ({ time: pt.eventDate, height: pt.value }));
+
+  const cacheResponse = new Response(JSON.stringify(predictions), {
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=21600' },
+  });
+  if (ctx) ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+  else await cache.put(cacheKey, cacheResponse);
+
+  return predictions;
+}
+
+// Caches the full /api/tides response, bucketed to 15 minutes to match the
+// underlying wlo/wlp resolution — any request within a bucket would get the
+// same source values as a fresh fetch anyway, so this loses no accuracy.
+// Before serving a cached entry it double-checks that nextLow/nextHigh are
+// still actually in the future; if either has slipped into the past since
+// the entry was cached, it's treated as stale and a fresh fetch runs instead.
+async function fetchTideDataCached(ctx) {
   const now = new Date();
-  const from = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+  const bucketMs = 15 * 60 * 1000;
+  const bucketStart = new Date(Math.floor(now.getTime() / bucketMs) * bucketMs);
+  const cache = caches.default;
+  const cacheKey = new Request(`https://tide-cache.internal/full?bucket=${bucketStart.toISOString()}`);
+
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    const tide = await cached.json();
+    const nowMs = now.getTime();
+    const lowStillFuture = !tide.nextLow || new Date(tide.nextLow.time).getTime() > nowMs;
+    const highStillFuture = !tide.nextHigh || new Date(tide.nextHigh.time).getTime() > nowMs;
+    if (lowStillFuture && highStillFuture) return tide;
+    // Fall through to a fresh fetch — a predicted event passed while this was cached.
+  }
+
+  const tide = await fetchTideData(ctx);
+  if (tide) {
+    const cacheResponse = new Response(JSON.stringify(tide), {
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${bucketMs / 1000}` },
+    });
+    if (ctx) ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+    else await cache.put(cacheKey, cacheResponse);
+  }
+  return tide;
+}
+
+async function fetchTideData(ctx) {
+  const now = new Date();
+  const from = new Date(now.getTime() - 60 * 60 * 1000);
   const to = new Date(now.getTime() + 15 * 60 * 1000);
 
   // Prefer observed water level; fall back to predicted if the gauge is
@@ -208,9 +271,14 @@ async function fetchTideData() {
     else if (latest.value < prev.value - 0.01) trend = 'falling';
   }
 
-  // Next/previous high or low, from the official tide table predictions.
-  const hiloFrom = new Date(now.getTime() - 12 * 60 * 60 * 1000);
-  const hiloTo = new Date(now.getTime() + 18 * 60 * 60 * 1000);
+  // Next low/high, from the official tide table predictions. Point Atkinson
+  // has a mixed semidiurnal tide, so the gap between events isn't a clean
+  // 12.4h — +15h forward comfortably covers even irregular spacing,
+  // guaranteeing the next low and next high are both caught. No back-window
+  // needed: the classifier below handles the first returned event by
+  // comparing it forward to the next one, not backward.
+  const hiloFrom = now;
+  const hiloTo = new Date(now.getTime() + 15 * 60 * 60 * 1000);
   const hiloData = await fetchTideSeries('wlp-hilo', hiloFrom, hiloTo, null);
 
   const classified = hiloData.map((pt, i, arr) => {
@@ -234,10 +302,14 @@ async function fetchTideData() {
   const nextHigh = classified.find(e => e.type === 'high' && new Date(e.time).getTime() > nowMs) || null;
 
   // Wider prediction curve for the graph: 6 hours back, 42 hours ahead.
-  const curveFrom = new Date(now.getTime() - 6 * 60 * 60 * 1000);
-  const curveTo = new Date(now.getTime() + 42 * 60 * 60 * 1000);
-  const curveData = await fetchTideSeries('wlp', curveFrom, curveTo, 'FIFTEEN_MINUTES');
-  const predictions = curveData.map(pt => ({ time: pt.eventDate, height: pt.value }));
+  // Cached at the edge for 6h — see fetchTideCurve().
+  const curveData = await fetchTideCurve(now, ctx);
+  const curveFromMs = now.getTime() - 6 * 60 * 60 * 1000;
+  const curveToMs = now.getTime() + 42 * 60 * 60 * 1000;
+  const predictions = curveData.filter((p) => {
+    const t = new Date(p.time).getTime();
+    return t >= curveFromMs && t <= curveToMs;
+  });
 
   return {
     height: latest.value,
@@ -669,9 +741,9 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
     </div>
     <div class="data-info">
-        Data Sources:: Wind: <a href="https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce" target="_blank" rel="noopener">WeatherLink API</a>, Jericho Sailing Centre — 1-min data.
-        JSCA: <a href="https://jsca.bc.ca/main/downld02.txt" target="_blank" rel="noopener">downld02.txt</a> — 30-min gust/rain feed.
-        Tide: <a href="https://api-iwls.dfo-mpo.gc.ca/api/v1/stations" target="_blank" rel="noopener">CHS/DFO IWLS API</a>, Point Atkinson (07795).
+        Raw (Jericho Sailing Centre — 1-min data): <a href="https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce" target="_blank" rel="noopener">WeatherLink API</a>. Avg is summary of the Raw into 30-minute buckets (max and average).<br>
+        JSC (Jericho Sailing Centre 30 min data): <a href="https://jsca.bc.ca/main/downld02.txt" target="_blank" rel="noopener">downld02.txt</a>.<br>
+        Tide (Point Atkinson): <a href="https://api-iwls.dfo-mpo.gc.ca/api/v1/stations" target="_blank" rel="noopener">CHS/DFO IWLS API</a>.
     </div>
     <script>
     (function() {
@@ -941,6 +1013,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     plugins: {
                         legend: { display: false },
                         tooltip: {
+                            enabled: tooltipEnabled,
                             callbacks: {
                                 title: function(items) {
                                     return new Date(items[0].parsed.x).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
@@ -967,6 +1040,101 @@ const HTML_PAGE = `<!DOCTYPE html>
             });
         }
 
+        var lastTide = null;
+
+        function renderTideStats(tide) {
+            document.getElementById('tideHeight').textContent = tide.height.toFixed(1);
+
+            var trendEl = document.getElementById('tideTrend');
+            trendEl.classList.remove('tide-trend-rising', 'tide-trend-falling', 'tide-trend-steady');
+            if (tide.trend === 'rising') {
+                trendEl.textContent = 'Rising \u2191';
+                trendEl.classList.add('tide-trend-rising');
+            } else if (tide.trend === 'falling') {
+                trendEl.textContent = 'Falling \u2193';
+                trendEl.classList.add('tide-trend-falling');
+            } else {
+                trendEl.textContent = 'Steady \u2192';
+                trendEl.classList.add('tide-trend-steady');
+            }
+
+            if (tide.nextLow) {
+                document.getElementById('tideNextLow').textContent = formatTideTime(tide.nextLow.time) + ' (' + tide.nextLow.height.toFixed(1) + 'm)';
+                document.getElementById('tideNextLowDate').textContent = formatTideDate(tide.nextLow.time);
+            }
+            if (tide.nextHigh) {
+                document.getElementById('tideNextHigh').textContent = formatTideTime(tide.nextHigh.time) + ' (' + tide.nextHigh.height.toFixed(1) + 'm)';
+                document.getElementById('tideNextHighDate').textContent = formatTideDate(tide.nextHigh.time);
+            }
+
+            var lowCard = document.getElementById('tideLowCard');
+            var highCard = document.getElementById('tideHighCard');
+            if (tide.nextLow && tide.nextHigh && lowCard && highCard) {
+                var lowTime = new Date(tide.nextLow.time).getTime();
+                var highTime = new Date(tide.nextHigh.time).getTime();
+                if (highTime < lowTime) {
+                    highCard.parentNode.insertBefore(highCard, lowCard);
+                } else {
+                    highCard.parentNode.insertBefore(lowCard, highCard);
+                }
+            }
+        }
+
+        // Linear interpolation between the two prediction points bracketing
+        // atMs, so the "current height" can be re-derived locally without a
+        // network call, matching what the wlp curve says for that instant.
+        function interpolateTideHeight(predictions, atMs) {
+            if (!predictions || !predictions.length) return null;
+            for (var i = 0; i < predictions.length - 1; i++) {
+                var t0 = new Date(predictions[i].time).getTime();
+                var t1 = new Date(predictions[i + 1].time).getTime();
+                if (atMs >= t0 && atMs <= t1) {
+                    var frac = (t1 === t0) ? 0 : (atMs - t0) / (t1 - t0);
+                    return predictions[i].height + frac * (predictions[i + 1].height - predictions[i].height);
+                }
+            }
+            var firstT = new Date(predictions[0].time).getTime();
+            if (atMs < firstT) return predictions[0].height;
+            return predictions[predictions.length - 1].height;
+        }
+
+        // Trend from the slope of the bracketing curve segment — same 0.01m
+        // threshold the backend uses for the observed-data version.
+        function localTideTrend(predictions, atMs) {
+            if (!predictions || predictions.length < 2) return 'steady';
+            for (var i = 0; i < predictions.length - 1; i++) {
+                var t0 = new Date(predictions[i].time).getTime();
+                var t1 = new Date(predictions[i + 1].time).getTime();
+                if (atMs >= t0 && atMs <= t1) {
+                    var diff = predictions[i + 1].height - predictions[i].height;
+                    if (diff > 0.01) return 'rising';
+                    if (diff < -0.01) return 'falling';
+                    return 'steady';
+                }
+            }
+            return 'steady';
+        }
+
+        // Called whenever wind data refreshes (hour buttons, custom range,
+        // source toggle). Re-derives the tide display from the already-
+        // fetched prediction curve instead of hitting /api/tides again —
+        // unless the next low or next high has slipped into the past, in
+        // which case a real fetch is needed to get the new next event.
+        function refreshTideDisplay() {
+            if (!lastTide) { fetchTideData(); return; }
+            var nowMs = Date.now();
+            var lowPassed = lastTide.nextLow && new Date(lastTide.nextLow.time).getTime() <= nowMs;
+            var highPassed = lastTide.nextHigh && new Date(lastTide.nextHigh.time).getTime() <= nowMs;
+            if (lowPassed || highPassed) { fetchTideData(); return; }
+
+            var height = interpolateTideHeight(lastTide.predictions, nowMs);
+            if (height == null) { fetchTideData(); return; }
+            var trend = localTideTrend(lastTide.predictions, nowMs);
+
+            renderTideStats({ height: height, trend: trend, nextLow: lastTide.nextLow, nextHigh: lastTide.nextHigh });
+            renderTideChart({ predictions: lastTide.predictions, height: height });
+        }
+
         function fetchTideData() {
             fetch('/api/tides')
                 .then(function(resp) {
@@ -975,43 +1143,8 @@ const HTML_PAGE = `<!DOCTYPE html>
                 })
                 .then(function(tide) {
                     if (!tide || tide.height == null) return;
-
-                    document.getElementById('tideHeight').textContent = tide.height.toFixed(1);
-
-                    var trendEl = document.getElementById('tideTrend');
-                    trendEl.classList.remove('tide-trend-rising', 'tide-trend-falling', 'tide-trend-steady');
-                    if (tide.trend === 'rising') {
-                        trendEl.textContent = 'Rising \u2191';
-                        trendEl.classList.add('tide-trend-rising');
-                    } else if (tide.trend === 'falling') {
-                        trendEl.textContent = 'Falling \u2193';
-                        trendEl.classList.add('tide-trend-falling');
-                    } else {
-                        trendEl.textContent = 'Steady \u2192';
-                        trendEl.classList.add('tide-trend-steady');
-                    }
-
-                    if (tide.nextLow) {
-                        document.getElementById('tideNextLow').textContent = formatTideTime(tide.nextLow.time) + ' (' + tide.nextLow.height.toFixed(1) + 'm)';
-                        document.getElementById('tideNextLowDate').textContent = formatTideDate(tide.nextLow.time);
-                    }
-                    if (tide.nextHigh) {
-                        document.getElementById('tideNextHigh').textContent = formatTideTime(tide.nextHigh.time) + ' (' + tide.nextHigh.height.toFixed(1) + 'm)';
-                        document.getElementById('tideNextHighDate').textContent = formatTideDate(tide.nextHigh.time);
-                    }
-
-                    var lowCard = document.getElementById('tideLowCard');
-                    var highCard = document.getElementById('tideHighCard');
-                    if (tide.nextLow && tide.nextHigh && lowCard && highCard) {
-                        var lowTime = new Date(tide.nextLow.time).getTime();
-                        var highTime = new Date(tide.nextHigh.time).getTime();
-                        if (highTime < lowTime) {
-                            highCard.parentNode.insertBefore(highCard, lowCard);
-                        } else {
-                            highCard.parentNode.insertBefore(lowCard, highCard);
-                        }
-                    }
-
+                    lastTide = tide;
+                    renderTideStats(tide);
                     renderTideChart(tide);
                 })
                 .catch(function(err) {
@@ -1203,6 +1336,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 customRange = null;
                 document.getElementById('customRange').style.display = 'none';
                 fetchData();
+                refreshTideDisplay();
             });
         });
 
@@ -1239,6 +1373,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             if (isNaN(from) || isNaN(to) || from >= to) { alert('Invalid range'); return; }
             customRange = { min: Math.floor(from.getTime() / 1000), max: Math.floor(to.getTime() / 1000) };
             fetchData();
+            refreshTideDisplay();
         });
 
         document.querySelectorAll('input[name="sourceMode"]').forEach(function(input) {
@@ -1247,6 +1382,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 if (!this.checked) return;
                 sourceMode = this.value;
                 fetchData();
+                refreshTideDisplay();
             });
         });
 
