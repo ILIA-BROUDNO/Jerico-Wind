@@ -596,7 +596,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             color: #0f1923;
             font-weight: 600;
         }
-        .data-info { font-size: 0.75rem; color: #546e7a; text-align: center; margin-top: 15px; }
+        .data-info { font-size: 0.75rem; color: #546e7a; text-align: left; margin-top: 15px; }
         .data-info a { color: #4fc3f7; text-decoration: none; }
         .data-info a:hover { text-decoration: underline; }
 
@@ -716,6 +716,12 @@ const HTML_PAGE = `<!DOCTYPE html>
         <h2>Wind Direction</h2>
         <div class="chart-wrapper"><canvas id="directionChart"></canvas></div>
     </div>
+    <!-- 
+    // <div class="chart-container">
+    //     <h2>7 Day Forecast</h2>
+    //     <div class="chart-wrapper"><canvas id="forecastChart"></canvas></div>
+    // </div> 
+    -->
     <div class="tide-section">
         <h2>Tide — Point Atkinson</h2>
         <div class="tide-summary">
@@ -740,11 +746,14 @@ const HTML_PAGE = `<!DOCTYPE html>
         </div>
         <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
     </div>
-    <div class="data-info">
-        Raw (Jericho Sailing Centre — 1-min data): <a href="https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce" target="_blank" rel="noopener">WeatherLink API</a>. Avg is summary of the Raw into 30-minute buckets (max and average).<br>
-        JSC (Jericho Sailing Centre 30 min data): <a href="https://jsca.bc.ca/main/downld02.txt" target="_blank" rel="noopener">downld02.txt</a>.<br>
-        Tide (Point Atkinson): <a href="https://api-iwls.dfo-mpo.gc.ca/api/v1/stations" target="_blank" rel="noopener">CHS/DFO IWLS API</a>.
-    </div>
+    <center>
+        <div class="data-info">
+            Raw (Jericho Sailing Centre — 1-min data): <a href="https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce" target="_blank" rel="noopener">WeatherLink API</a>.<br>
+            Avg is summary of the Raw into 30-minute buckets (max and average).<br>
+            JSC (Jericho Sailing Centre 30 min data): <a href="https://jsca.bc.ca/main/downld02.txt" target="_blank" rel="noopener">downld02.txt</a>.<br>
+            Tide (Point Atkinson): <a href="https://api-iwls.dfo-mpo.gc.ca/api/v1/stations" target="_blank" rel="noopener">CHS/DFO IWLS API</a>.
+        </div>
+    </center>
     <script>
     (function() {
         var displayHours = 1;
@@ -968,6 +977,130 @@ const HTML_PAGE = `<!DOCTYPE html>
         }
 
         var tideChart;
+        // var forecastChart;
+
+        // function fetchForecastData() {
+        //     var url = 'https://api.open-meteo.com/v1/forecast?latitude=49.2497&longitude=-123.1193&hourly=wind_speed_80m,wind_gusts_10m,wind_direction_80m,temperature_2m,precipitation_probability,precipitation&timezone=America%2FLos_Angeles&wind_speed_unit=kn';
+        //     fetch(url)
+        //         .then(function(resp) {
+        //             if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        //             return resp.json();
+        //         })
+        //         .then(renderForecastChart)
+        //         .catch(function(err) {
+        //             console.error('Forecast fetch failed:', err.message);
+        //         });
+        // }
+
+        // var forecastDirections = [];
+        // var forecastTemps = [];
+        // var forecastPrecip = [];
+
+        // var forecastIconsPlugin = {
+        //     id: 'forecastIcons',
+        //     afterDatasetsDraw: function(chart) {
+        //         var ctx = chart.ctx;
+        //         var xScale = chart.scales.x;
+        //         var yScale = chart.scales.y;
+        //         var windPts = chart.data.datasets[0].data;
+        //         if (!windPts.length) return;
+
+        //         var maxArrows = Math.max(1, Math.floor(xScale.width / 24));
+        //         var step = Math.max(1, Math.floor(windPts.length / maxArrows));
+
+        //         for (var i = 0; i < windPts.length; i += step) {
+        //             var dir = forecastDirections[i];
+        //             if (dir == null) continue;
+        //             var x = xScale.getPixelForValue(windPts[i].x);
+        //             var y = yScale.getPixelForValue(windPts[i].y);
+        //             drawArrow(ctx, x, y, (dir + 180) * Math.PI / 180, 12, 'rgba(174,213,129,0.85)');
+
+        //             var temp = forecastTemps[i];
+        //             var rainLevel = rainIntensityLevel(forecastPrecip[i]);
+        //             var flip = (y - (rainLevel > 0 ? 34 : 28)) < chart.chartArea.top;
+        //             var fdir = flip ? 1 : -1;
+        //             var iconY = y + fdir * 22;
+        //             if (rainLevel > 0) {
+        //                 drawRainDrops(ctx, x, iconY + fdir * 5, rainLevel, 4, 'rgba(79,195,247,0.9)');
+        //             }
+        //             if (temp != null) {
+        //                 var tY = rainLevel > 0 ? iconY - fdir * 7 : iconY;
+        //                 drawTempLabel(ctx, x, tY, Math.round(temp) + '\u00B0', 'rgba(224,224,224,0.85)');
+        //             }
+        //         }
+        //     },
+        // };
+
+        // function renderForecastChart(data) {
+        //     var canvas = document.getElementById('forecastChart');
+        //     if (!canvas || !data.hourly) return;
+
+        //     var times = data.hourly.time.map(function(t) { return new Date(t).getTime(); });
+        //     var toXY = function(arr) { return times.map(function(t, i) { return { x: t, y: arr[i] }; }); };
+        //     forecastDirections = data.hourly.wind_direction_80m;
+        //     forecastTemps = data.hourly.temperature_2m;
+        //     forecastPrecip = data.hourly.precipitation;
+
+        //     if (forecastChart) forecastChart.destroy();
+        //     forecastChart = new Chart(canvas, {
+        //         data: {
+        //             datasets: [
+        //                 { 
+        //                     type: 'line', 
+        //                     label: 'Wind Speed',
+        //                     borderColor: '#4fc3f7',
+        //                     backgroundColor: 'rgba(79,195,247,0.1)',
+        //                     fill: true,
+        //                     tension: 0.1,
+        //                     data: toXY(data.hourly.wind_speed_80m), 
+        //                     yAxisID: 'y', 
+        //                     pointRadius: 0, 
+        //                     borderWidth: 2, 
+        //                 },
+        //                 { 
+        //                     type: 'line', 
+        //                     label: 'Gust', 
+        //                     borderColor: '#ff7043', 
+        //                     backgroundColor: 'rgba(255,112,67,0.05)',
+        //                     fill: true,
+        //                     tension: 0.1,
+        //                     data: toXY(data.hourly.wind_gusts_10m), 
+        //                     yAxisID: 'y', 
+        //                     pointRadius: 0, 
+        //                     borderWidth: 1.5, 
+        //                     borderDash: [4, 3]
+        //                 },
+        //             ],
+        //         },
+        //         options: {
+        //             responsive: true,
+        //             maintainAspectRatio: false,
+        //             interaction: { mode: 'index', intersect: false },
+        //             plugins: {
+        //                 legend: { labels: { color: '#90a4ae' } },
+        //                 tooltip: { enabled: tooltipEnabled },
+        //             },
+        //             scales: {
+        //                 x: {
+        //                     type: 'time',
+        //                     time: { tooltipFormat: 'yyyy-MM-dd HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'MMM d' } },
+        //                     grid: { color: 'rgba(255,255,255,0.05)' },
+        //                     ticks: {
+        //                         color: '#78909c', maxTicksLimit: 12,
+        //                         callback: function(value, index, ticks) {
+        //                             var d = new Date(ticks[index].value);
+        //                             var timeStr = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+        //                             var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        //                             return [timeStr, months[d.getMonth()] + ' ' + d.getDate()];
+        //                         }
+        //                     }
+        //                 },
+        //                 y: { position: 'left', grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#78909c', callback: function(v) { return v + 'kn'; } } },
+        //             },
+        //         },
+        //         plugins: [forecastIconsPlugin],
+        //     });
+        // }
 
         function renderTideChart(tide) {
             var canvas = document.getElementById('tideChart');
@@ -1027,9 +1160,17 @@ const HTML_PAGE = `<!DOCTYPE html>
                     scales: {
                         x: {
                             type: 'time',
-                            time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+                            time: { tooltipFormat: 'yyyy-MM-dd HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'MMM d' } },
                             grid: { color: 'rgba(255,255,255,0.05)' },
-                            ticks: { color: '#78909c', maxRotation: 0 },
+                            ticks: {
+                                color: '#78909c', maxTicksLimit: 12,
+                                callback: function(value, index, ticks) {
+                                    var d = new Date(ticks[index].value);
+                                    var timeStr = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+                                    var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                                    return [timeStr, months[d.getMonth()] + ' ' + d.getDate()];
+                                }
+                            }
                         },
                         y: {
                             grid: { color: 'rgba(255,255,255,0.05)' },
@@ -1166,7 +1307,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                             borderColor: '#4fc3f7',
                             backgroundColor: 'rgba(79,195,247,0.1)',
                             fill: true,
-                            tension: 0,
+                            tension: 0.1,
                             pointRadius: 2,
                             borderWidth: 2,
                             data: []
@@ -1176,7 +1317,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                             borderColor: '#ff7043',
                             backgroundColor: 'rgba(255,112,67,0.05)',
                             fill: true,
-                            tension: 0,
+                            tension: 0.1,
                             pointRadius: 0,
                             borderWidth: 1.5,
                             borderDash: [4, 2],
@@ -1389,6 +1530,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         createCharts();
         fetchData();
         fetchTideData();
+        //fetchForecastData();
     })();
     <\/script>
 </body>
