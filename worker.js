@@ -6,6 +6,15 @@
 const WEATHERLINK_URL = 'https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce';
 const JSCA_TXT_URL = 'https://jsca.bc.ca/main/downld02.txt';
 const PURGE_DAYS = 60;
+const CF_API_TOKEN = "cfut_21lDGFcXXqT5CsgJ7RXxNDJsBprsTAY8lCWFaTsrcb98f4ca";
+const ACCOUNT_ID = "a97cd900d4a12e5eeb56e95ae8eb9c49";
+const WORKER_SCRIPT_NAME = 'jerico-wind';
+const D1_DATABASE_ID = '383ddb26-b751-41b6-98d5-412fffd85f15';
+
+const FREE_PLAN_QUOTAS = {
+  workersRequestsPerDay: 100000,
+  d1RowsReadPerDay: 5000000,
+};
 
 async function handleScheduled(event, env) {
   await handleWeatherLinkScheduled(env);
@@ -104,7 +113,7 @@ async function handleAPI(request, env, ctx) {
       const oldest = Math.floor(Date.now() / 1000) - PURGE_DAYS * 86400;
       if (since < oldest) since = oldest;
     } else {
-      const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '6', 10), 1), PURGE_DAYS * 24);
+      const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '1', 10), 1), PURGE_DAYS * 24);
       since = Math.floor(Date.now() / 1000) - hours * 3600;
       until = Math.floor(Date.now() / 1000);
     }
@@ -159,6 +168,10 @@ async function handleAPI(request, env, ctx) {
   } else if (url.pathname === '/api/tides') {
     const tide = await fetchTideDataCached(ctx);
     response = tide ? jsonResponse(tide) : jsonResponse({ error: 'Tide data unavailable' }, 502);
+
+  } else if (url.pathname === '/api/usage') {
+    const usage = await fetchUsageFromGraphQL();
+    response = usage ? jsonResponse(usage) : jsonResponse({ error: 'Usage data unavailable' }, 502);
 
   } else {
     return jsonResponse({ error: 'Not found' }, 404);
@@ -323,6 +336,74 @@ async function fetchTideData(ctx) {
     nextHigh: nextHigh,
     events: classified,
     predictions: predictions,
+  };
+}
+
+// --- Free-plan usage stats (Workers requests + D1 rows read, today) ---
+async function fetchUsageFromGraphQL() {
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10); // UTC date, matches Cloudflare's daily reset
+  const dayStartUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const dtStart = dayStartUTC.toISOString();
+  const dtEnd = now.toISOString();
+
+  const query = `
+    query UsageToday($accountTag: string!, $day: Date!, $dtStart: string!, $dtEnd: string!, $scriptName: string!, $databaseId: string!) {
+      viewer {
+        accounts(filter: { accountTag: $accountTag }) {
+          workers: workersInvocationsAdaptive(
+            filter: { scriptName: $scriptName, datetime_geq: $dtStart, datetime_leq: $dtEnd }
+            limit: 10000
+          ) {
+            sum { requests }
+          }
+          d1: d1AnalyticsAdaptiveGroups(
+            filter: { date_geq: $day, date_leq: $day, databaseId: $databaseId }
+            limit: 10
+          ) {
+            sum { rowsRead }
+          }
+        }
+      }
+    }`;
+
+  const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${CF_API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      query,
+      variables: {
+        accountTag: ACCOUNT_ID,
+        day: today,
+        dtStart,
+        dtEnd,
+        scriptName: WORKER_SCRIPT_NAME,
+        databaseId: D1_DATABASE_ID,
+      },
+    }),
+  });
+
+  if (!resp.ok) return null;
+  const json = await resp.json();
+  if (json.errors && json.errors.length) {
+    console.error('GraphQL usage query errors:', JSON.stringify(json.errors));
+    return null;
+  }
+
+  const account = json.data && json.data.viewer && json.data.viewer.accounts && json.data.viewer.accounts[0];
+  const workersRows = (account && account.workers) || [];
+  const d1Rows = (account && account.d1) || [];
+  const requests = workersRows.reduce((sum, r) => sum + ((r.sum && r.sum.requests) || 0), 0);
+  const rowsRead = d1Rows.reduce((sum, r) => sum + ((r.sum && r.sum.rowsRead) || 0), 0);
+
+  return {
+    date: today,
+    workersRequests: requests,
+    d1RowsRead: rowsRead,
+    quotas: FREE_PLAN_QUOTAS,
   };
 }
 
@@ -646,6 +727,57 @@ const HTML_PAGE = `<!DOCTYPE html>
             .tide-summary { grid-template-columns: repeat(2, 1fr); }
         }
 
+        .usage-section {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #1e2d3a;
+        }
+        .usage-section h2 {
+            font-size: 1rem;
+            color: #4fc3f7;
+            margin: 0 0 15px;
+            font-weight: 600;
+        }
+        .usage-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        .usage-stat {
+            background: #16222d;
+            border: 1px solid #22303c;
+            border-radius: 10px;
+            padding: 12px 14px;
+        }
+        .usage-stat .label {
+            font-size: 0.7rem;
+            color: #78909c;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 4px;
+        }
+        .usage-stat .value {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #e0e0e0;
+        }
+        .usage-stat .sub { font-size: 0.72rem; color: #90a4ae; margin-top: 2px; }
+        .usage-bar {
+            margin-top: 8px;
+            height: 6px;
+            border-radius: 3px;
+            background: #0f1923;
+            overflow: hidden;
+        }
+        .usage-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            background: #4fc3f7;
+            transition: width 0.3s ease;
+        }
+        .usage-bar-fill.warn { background: #ffb74d; }
+        .usage-bar-fill.danger { background: #ff7043; }
+
         @media (max-width: 480px) {
             body { padding: 12px; }
             .current-conditions {
@@ -746,6 +878,23 @@ const HTML_PAGE = `<!DOCTYPE html>
             </div>
         </div>
         <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
+    </div>
+    <div class="usage-section">
+        <h2>Cloudflare Free Plan Usage — Today (resets 00:00 UTC / <span id="resetTimeLocal"></span> local)</h2>
+        <div class="usage-summary">
+            <div class="usage-stat">
+                <div class="label">Worker Requests</div>
+                <div class="value"><span id="usageRequestsPct">--</span></div>
+                <div class="sub"><span id="usageRequestsCount">--</span></div>
+                <div class="usage-bar"><div class="usage-bar-fill" id="usageRequestsBar" style="width:0%"></div></div>
+            </div>
+            <div class="usage-stat">
+                <div class="label">D1 Rows Read</div>
+                <div class="value"><span id="usageD1Pct">--</span></div>
+                <div class="sub"><span id="usageD1Count">--</span></div>
+                <div class="usage-bar"><div class="usage-bar-fill" id="usageD1Bar" style="width:0%"></div></div>
+            </div>
+        </div>
     </div>
     <center>
         <div class="data-info">
@@ -933,8 +1082,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         var sourceMode = 'raw';
 
         function fetchData() {
-            var url;
-            if (sourceMode === 'jsc') {
+            var url;            if (sourceMode === 'jsc') {
                 if (customRange) {
                     url = '/api/jsca-txt?min=' + customRange.min + '&max=' + customRange.max;
                 } else {
@@ -1295,6 +1443,37 @@ const HTML_PAGE = `<!DOCTYPE html>
                 });
         }
 
+        function fetchUsageData() {        
+            document.getElementById('resetTimeLocal').textContent = new Date(0).toLocaleTimeString([], {timeStyle: 'short'});
+            fetch('/api/usage')
+                .then(function(resp) {
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    return resp.json();
+                })
+                .then(function(usage) {
+                    if (!usage) return;
+                    renderUsageBar('usageRequestsPct', 'usageRequestsCount', 'usageRequestsBar',
+                        usage.workersRequests, usage.quotas.workersRequestsPerDay, 'requests');
+                    renderUsageBar('usageD1Pct', 'usageD1Count', 'usageD1Bar',
+                        usage.d1RowsRead, usage.quotas.d1RowsReadPerDay, 'rows read');
+                })
+                .catch(function(err) {
+                    // Usage stats are supplementary; fail quietly rather than blocking the main display.
+                    console.error('Usage fetch failed:', err.message);
+                });
+        }
+
+        function renderUsageBar(pctId, countId, barId, used, quota, unitLabel) {
+            var pct = quota ? Math.min(100, (used / quota) * 100) : 0;
+            document.getElementById(pctId).textContent = pct.toFixed(1) + '%';
+            document.getElementById(countId).textContent = used.toLocaleString() + ' / ' + quota.toLocaleString() + ' ' + unitLabel;
+            var bar = document.getElementById(barId);
+            bar.style.width = pct + '%';
+            bar.classList.remove('warn', 'danger');
+            if (pct >= 90) bar.classList.add('danger');
+            else if (pct >= 70) bar.classList.add('warn');
+        }
+
         function createCharts() {
             var gridColor = 'rgba(255,255,255,0.06)';
             var tickColor = '#546e7a';
@@ -1531,6 +1710,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         createCharts();
         fetchData();
         fetchTideData();
+        fetchUsageData();
         //fetchForecastData();
     })();
     <\/script>
