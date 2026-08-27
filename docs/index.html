@@ -771,12 +771,11 @@
         }
 
         function fetchTideData() {
-            //fetch('https://jerico-wind.iliab.workers.dev/api/tides')
-                // .then(function(resp) {
-                //     if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                //     return resp.json();
-                // })
-            cachedFetch('https://jerico-wind.iliab.workers.dev/api/tides', 2 * 60 * 1000) 
+            fetch('https://jerico-wind.iliab.workers.dev/api/tides')
+                .then(function(resp) {
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    return resp.json();
+                }) 
                 .then(function(tide) {
                     if (!tide || tide.height == null) return;
                     lastTide = tide;
