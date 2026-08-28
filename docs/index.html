@@ -116,6 +116,18 @@
             padding-top: 20px;
             border-top: 1px solid #1e2d3a;
         }
+        .accordion-header {
+            cursor: pointer;
+            user-select: none;
+        }
+        .accordion-icon {
+            display: inline-block;
+            margin-left: 6px;
+            transition: transform 0.15s ease;
+        }
+        .accordion-header.expanded .accordion-icon {
+            transform: rotate(90deg);
+        }
         .tide-section h2 {
             font-size: 1rem;
             color: #4fc3f7;
@@ -224,28 +236,30 @@
     // </div> 
     -->
     <div class="tide-section">
-        <h2>Tide — Point Atkinson</h2>
-        <div class="tide-summary">
-            <div class="tide-stat">
-                <div class="label">Current Height</div>
-                <div class="value"><span id="tideHeight">--</span><span class="unit">m</span></div>
+        <h2 class="accordion-header" id="tideHeader">Tide — Point Atkinson<span class="accordion-icon">&#9656;</span></h2>
+        <div class="accordion-body" id="tideBody" style="display:none;">
+            <div class="tide-summary">
+                <div class="tide-stat">
+                    <div class="label">Current Height</div>
+                    <div class="value"><span id="tideHeight">--</span><span class="unit">m</span></div>
+                </div>
+                <div class="tide-stat">
+                    <div class="label">Trend</div>
+                    <div class="value"><span id="tideTrend">--</span></div>
+                </div>
+                <div class="tide-stat" id="tideLowCard">
+                    <div class="label">Next Low</div>
+                    <div class="value"><span id="tideNextLow">--</span></div>
+                    <div class="sub"><span id="tideNextLowDate">&nbsp;</span></div>
+                </div>
+                <div class="tide-stat" id="tideHighCard">
+                    <div class="label">Next High</div>
+                    <div class="value"><span id="tideNextHigh">--</span></div>
+                    <div class="sub"><span id="tideNextHighDate">&nbsp;</span></div>
+                </div>
             </div>
-            <div class="tide-stat">
-                <div class="label">Trend</div>
-                <div class="value"><span id="tideTrend">--</span></div>
-            </div>
-            <div class="tide-stat" id="tideLowCard">
-                <div class="label">Next Low</div>
-                <div class="value"><span id="tideNextLow">--</span></div>
-                <div class="sub"><span id="tideNextLowDate">&nbsp;</span></div>
-            </div>
-            <div class="tide-stat" id="tideHighCard">
-                <div class="label">Next High</div>
-                <div class="value"><span id="tideNextHigh">--</span></div>
-                <div class="sub"><span id="tideNextHighDate">&nbsp;</span></div>
-            </div>
+            <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
         </div>
-        <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
     </div>
     <center>
         <div class="data-info">
@@ -715,61 +729,6 @@
             }
         }
 
-        // Linear interpolation between the two prediction points bracketing
-        // atMs, so the "current height" can be re-derived locally without a
-        // network call, matching what the wlp curve says for that instant.
-        function interpolateTideHeight(predictions, atMs) {
-            if (!predictions || !predictions.length) return null;
-            for (var i = 0; i < predictions.length - 1; i++) {
-                var t0 = new Date(predictions[i].time).getTime();
-                var t1 = new Date(predictions[i + 1].time).getTime();
-                if (atMs >= t0 && atMs <= t1) {
-                    var frac = (t1 === t0) ? 0 : (atMs - t0) / (t1 - t0);
-                    return predictions[i].height + frac * (predictions[i + 1].height - predictions[i].height);
-                }
-            }
-            var firstT = new Date(predictions[0].time).getTime();
-            if (atMs < firstT) return predictions[0].height;
-            return predictions[predictions.length - 1].height;
-        }
-
-        // Trend from the slope of the bracketing curve segment — same 0.01m
-        // threshold the backend uses for the observed-data version.
-        function localTideTrend(predictions, atMs) {
-            if (!predictions || predictions.length < 2) return 'steady';
-            for (var i = 0; i < predictions.length - 1; i++) {
-                var t0 = new Date(predictions[i].time).getTime();
-                var t1 = new Date(predictions[i + 1].time).getTime();
-                if (atMs >= t0 && atMs <= t1) {
-                    var diff = predictions[i + 1].height - predictions[i].height;
-                    if (diff > 0.01) return 'rising';
-                    if (diff < -0.01) return 'falling';
-                    return 'steady';
-                }
-            }
-            return 'steady';
-        }
-
-        // Called whenever wind data refreshes (hour buttons, custom range,
-        // source toggle). Re-derives the tide display from the already-
-        // fetched prediction curve instead of hitting /api/tides again —
-        // unless the next low or next high has slipped into the past, in
-        // which case a real fetch is needed to get the new next event.
-        function refreshTideDisplay() {
-            if (!lastTide) { fetchTideData(); return; }
-            var nowMs = Date.now();
-            var lowPassed = lastTide.nextLow && new Date(lastTide.nextLow.time).getTime() <= nowMs;
-            var highPassed = lastTide.nextHigh && new Date(lastTide.nextHigh.time).getTime() <= nowMs;
-            if (lowPassed || highPassed) { fetchTideData(); return; }
-
-            var height = interpolateTideHeight(lastTide.predictions, nowMs);
-            if (height == null) { fetchTideData(); return; }
-            var trend = localTideTrend(lastTide.predictions, nowMs);
-
-            renderTideStats({ height: height, trend: trend, nextLow: lastTide.nextLow, nextHigh: lastTide.nextHigh });
-            renderTideChart({ predictions: lastTide.predictions, height: height });
-        }
-
         function fetchTideData() {
             fetch('https://jerico-wind.iliab.workers.dev/api/tides')
                 .then(function(resp) {
@@ -989,7 +948,6 @@
                 this.classList.add('active');
                 displayHours = parseInt(this.dataset.hours);
                 fetchData();
-                refreshTideDisplay();
             });
         });
 
@@ -999,13 +957,19 @@
                 if (!this.checked) return;
                 sourceMode = this.value;
                 fetchData();
-                refreshTideDisplay();
             });
+        });
+
+        document.getElementById('tideHeader').addEventListener('click', function() {
+            var body = document.getElementById('tideBody');
+            var expanding = body.style.display === 'none';
+            body.style.display = expanding ? '' : 'none';
+            this.classList.toggle('expanded', expanding);
+            if (expanding) fetchTideData();
         });
 
         createCharts();
         fetchData();
-        fetchTideData();
         //fetchForecastData();
     })();
     </script>
