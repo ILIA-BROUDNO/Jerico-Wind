@@ -6,10 +6,7 @@
 const WEATHERLINK_URL = 'https://www.weatherlink.com/embeddablePage/getData/e25c3f542d98439b8acd3bcc217068ce';
 const JSCA_TXT_URL = 'https://jsca.bc.ca/main/downld02.txt';
 const PURGE_DAYS = 60;
-const CF_API_TOKEN = "cfut_21lDGFcXXqT5CsgJ7RXxNDJsBprsTAY8lCWFaTsrcb98f4ca";
-const ACCOUNT_ID = "a97cd900d4a12e5eeb56e95ae8eb9c49";
 const WORKER_SCRIPT_NAME = 'jerico-wind';
-const D1_DATABASE_ID = '383ddb26-b751-41b6-98d5-412fffd85f15';
 
 const FREE_PLAN_QUOTAS = {
   workersRequestsPerDay: 100000,
@@ -166,11 +163,11 @@ async function handleAPI(request, env, ctx) {
     response = jsonResponse(results[0] || null);
 
   } else if (url.pathname === '/api/tides') {
-    const tide = await fetchTideDataCached(ctx);
+    const tide = await fetchTideData(ctx);
     response = tide ? jsonResponse(tide) : jsonResponse({ error: 'Tide data unavailable' }, 502);
 
   } else if (url.pathname === '/api/usage') {
-    const usage = await fetchUsageFromGraphQL();
+    const usage = await fetchUsageFromGraphQL(env);
     response = usage ? jsonResponse(usage) : jsonResponse({ error: 'Usage data unavailable' }, 502);
 
   } else {
@@ -198,67 +195,12 @@ async function fetchTideSeries(code, fromDate, toDate, resolution) {
   }
 }
 
-// Fetches the 48-hour prediction curve, cached at the edge for 6 hours.
-// Predictions are deterministic (same values for the same time range no
-// matter who asks), so this is safe to cache aggressively and cuts out the
-// heaviest of the three CHS calls for almost all requests.
+// Fetches the prediction curve directly, no caching.
 async function fetchTideCurve(now, ctx) {
-  const bucketMs = 6 * 60 * 60 * 1000;
-  const bucketStart = new Date(Math.floor(now.getTime() / bucketMs) * bucketMs);
-  const cache = caches.default;
-  const cacheKey = new Request(`https://tide-cache.internal/curve?bucket=${bucketStart.toISOString()}`);
-
-  const cached = await cache.match(cacheKey);
-  if (cached) return await cached.json();
-
-  // Fetch wide enough to cover the whole 6h bucket plus the -6h/+42h range
-  // we need relative to "now" at any point within that bucket.
-  const curveFrom = new Date(bucketStart.getTime() - 6 * 60 * 60 * 1000);
-  const curveTo = new Date(bucketStart.getTime() + bucketMs + 42 * 60 * 60 * 1000);
+  const curveFrom = new Date(now.getTime() - 6 * 60 * 60 * 1000);
+  const curveTo = new Date(now.getTime() + 42 * 60 * 60 * 1000);
   const curveData = await fetchTideSeries('wlp', curveFrom, curveTo, 'FIFTEEN_MINUTES');
-  const predictions = curveData.map((pt) => ({ time: pt.eventDate, height: pt.value }));
-
-  const cacheResponse = new Response(JSON.stringify(predictions), {
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=21600' },
-  });
-  if (ctx) ctx.waitUntil(cache.put(cacheKey, cacheResponse));
-  else await cache.put(cacheKey, cacheResponse);
-
-  return predictions;
-}
-
-// Caches the full /api/tides response, bucketed to 15 minutes to match the
-// underlying wlo/wlp resolution — any request within a bucket would get the
-// same source values as a fresh fetch anyway, so this loses no accuracy.
-// Before serving a cached entry it double-checks that nextLow/nextHigh are
-// still actually in the future; if either has slipped into the past since
-// the entry was cached, it's treated as stale and a fresh fetch runs instead.
-async function fetchTideDataCached(ctx) {
-  const now = new Date();
-  const bucketMs = 15 * 60 * 1000;
-  const bucketStart = new Date(Math.floor(now.getTime() / bucketMs) * bucketMs);
-  const cache = caches.default;
-  const cacheKey = new Request(`https://tide-cache.internal/full?bucket=${bucketStart.toISOString()}`);
-
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    const tide = await cached.json();
-    const nowMs = now.getTime();
-    const lowStillFuture = !tide.nextLow || new Date(tide.nextLow.time).getTime() > nowMs;
-    const highStillFuture = !tide.nextHigh || new Date(tide.nextHigh.time).getTime() > nowMs;
-    if (lowStillFuture && highStillFuture) return tide;
-    // Fall through to a fresh fetch — a predicted event passed while this was cached.
-  }
-
-  const tide = await fetchTideData(ctx);
-  if (tide) {
-    const cacheResponse = new Response(JSON.stringify(tide), {
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${bucketMs / 1000}` },
-    });
-    if (ctx) ctx.waitUntil(cache.put(cacheKey, cacheResponse));
-    else await cache.put(cacheKey, cacheResponse);
-  }
-  return tide;
+  return curveData.map((pt) => ({ time: pt.eventDate, height: pt.value }));
 }
 
 async function fetchTideData(ctx) {
@@ -315,7 +257,6 @@ async function fetchTideData(ctx) {
   const nextHigh = classified.find(e => e.type === 'high' && new Date(e.time).getTime() > nowMs) || null;
 
   // Wider prediction curve for the graph: 6 hours back, 42 hours ahead.
-  // Cached at the edge for 6h — see fetchTideCurve().
   const curveData = await fetchTideCurve(now, ctx);
   const curveFromMs = now.getTime() - 6 * 60 * 60 * 1000;
   const curveToMs = now.getTime() + 42 * 60 * 60 * 1000;
@@ -340,7 +281,7 @@ async function fetchTideData(ctx) {
 }
 
 // --- Free-plan usage stats (Workers requests + D1 rows read, today) ---
-async function fetchUsageFromGraphQL() {
+async function fetchUsageFromGraphQL(env) {
   const now = new Date();
   const today = now.toISOString().slice(0, 10); // UTC date, matches Cloudflare's daily reset
   const dayStartUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -370,23 +311,26 @@ async function fetchUsageFromGraphQL() {
   const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${CF_API_TOKEN}`,
+      'Authorization': `Bearer ${env.CF_API_TOKEN}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
       query,
       variables: {
-        accountTag: ACCOUNT_ID,
+        accountTag: env.ACCOUNT_ID,
         day: today,
         dtStart,
         dtEnd,
         scriptName: WORKER_SCRIPT_NAME,
-        databaseId: D1_DATABASE_ID,
+        databaseId: env.D1_DATABASE_ID,
       },
     }),
   });
 
-  if (!resp.ok) return null;
+  if (!resp.ok) {
+    console.error('GraphQL usage request failed:', resp.status, await resp.text());
+    return null;
+  }
   const json = await resp.json();
   if (json.errors && json.errors.length) {
     console.error('GraphQL usage query errors:', JSON.stringify(json.errors));
@@ -687,6 +631,18 @@ const HTML_PAGE = `<!DOCTYPE html>
             padding-top: 20px;
             border-top: 1px solid #1e2d3a;
         }
+        .accordion-header {
+            cursor: pointer;
+            user-select: none;
+        }
+        .accordion-icon {
+            display: inline-block;
+            margin-left: 6px;
+            transition: transform 0.15s ease;
+        }
+        .accordion-header.expanded .accordion-icon {
+            transform: rotate(90deg);
+        }
         .tide-section h2 {
             font-size: 1rem;
             color: #4fc3f7;
@@ -856,43 +812,48 @@ const HTML_PAGE = `<!DOCTYPE html>
     // </div> 
     -->
     <div class="tide-section">
-        <h2>Tide — Point Atkinson</h2>
-        <div class="tide-summary">
-            <div class="tide-stat">
-                <div class="label">Current Height</div>
-                <div class="value"><span id="tideHeight">--</span><span class="unit">m</span></div>
+        <h2 class="accordion-header" id="tideHeader">Tide — Point Atkinson<span class="accordion-icon">&#9656;</span></h2>
+        <div class="accordion-body" id="tideBody" style="display:none;">
+            <div class="tide-summary">
+                <div class="tide-stat">
+                    <div class="label">Current Height</div>
+                    <div class="value"><span id="tideHeight">--</span><span class="unit">m</span></div>
+                    <div class="sub"><span id="tideCurrentTime">&nbsp;</span></div>
+                </div>
+                <div class="tide-stat">
+                    <div class="label">Trend</div>
+                    <div class="value"><span id="tideTrend">--</span></div>
+                </div>
+                <div class="tide-stat" id="tideLowCard">
+                    <div class="label">Next Low</div>
+                    <div class="value"><span id="tideNextLow">--</span></div>
+                    <div class="sub"><span id="tideNextLowDate">&nbsp;</span></div>
+                </div>
+                <div class="tide-stat" id="tideHighCard">
+                    <div class="label">Next High</div>
+                    <div class="value"><span id="tideNextHigh">--</span></div>
+                    <div class="sub"><span id="tideNextHighDate">&nbsp;</span></div>
+                </div>
             </div>
-            <div class="tide-stat">
-                <div class="label">Trend</div>
-                <div class="value"><span id="tideTrend">--</span></div>
-            </div>
-            <div class="tide-stat" id="tideLowCard">
-                <div class="label">Next Low</div>
-                <div class="value"><span id="tideNextLow">--</span></div>
-                <div class="sub"><span id="tideNextLowDate">&nbsp;</span></div>
-            </div>
-            <div class="tide-stat" id="tideHighCard">
-                <div class="label">Next High</div>
-                <div class="value"><span id="tideNextHigh">--</span></div>
-                <div class="sub"><span id="tideNextHighDate">&nbsp;</span></div>
-            </div>
+            <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
         </div>
-        <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
     </div>
     <div class="usage-section">
-        <h2>Cloudflare Free Plan Usage — Today (resets 00:00 UTC / <span id="resetTimeLocal"></span> local)</h2>
-        <div class="usage-summary">
-            <div class="usage-stat">
-                <div class="label">Worker Requests</div>
-                <div class="value"><span id="usageRequestsPct">--</span></div>
-                <div class="sub"><span id="usageRequestsCount">--</span></div>
-                <div class="usage-bar"><div class="usage-bar-fill" id="usageRequestsBar" style="width:0%"></div></div>
-            </div>
-            <div class="usage-stat">
-                <div class="label">D1 Rows Read</div>
-                <div class="value"><span id="usageD1Pct">--</span></div>
-                <div class="sub"><span id="usageD1Count">--</span></div>
-                <div class="usage-bar"><div class="usage-bar-fill" id="usageD1Bar" style="width:0%"></div></div>
+        <h2 class="accordion-header" id="usageHeader">Cloudflare Free Plan Usage — Today (resets 00:00 UTC / <span id="resetTimeLocal"></span> local)<span class="accordion-icon">&#9656;</span></h2>
+        <div class="accordion-body" id="usageBody" style="display:none;">
+            <div class="usage-summary">
+                <div class="usage-stat">
+                    <div class="label">Worker Requests</div>
+                    <div class="value"><span id="usageRequestsPct">--</span></div>
+                    <div class="sub"><span id="usageRequestsCount">--</span></div>
+                    <div class="usage-bar"><div class="usage-bar-fill" id="usageRequestsBar" style="width:0%"></div></div>
+                </div>
+                <div class="usage-stat">
+                    <div class="label">D1 Rows Read</div>
+                    <div class="value"><span id="usageD1Pct">--</span></div>
+                    <div class="sub"><span id="usageD1Count">--</span></div>
+                    <div class="usage-bar"><div class="usage-bar-fill" id="usageD1Bar" style="width:0%"></div></div>
+                </div>
             </div>
         </div>
     </div>
@@ -1334,6 +1295,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
         function renderTideStats(tide) {
             document.getElementById('tideHeight').textContent = tide.height.toFixed(1);
+            document.getElementById('tideCurrentTime').textContent = formatTideTime(new Date().toISOString());
 
             var trendEl = document.getElementById('tideTrend');
             trendEl.classList.remove('tide-trend-rising', 'tide-trend-falling', 'tide-trend-steady');
@@ -1370,64 +1332,9 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-        // Linear interpolation between the two prediction points bracketing
-        // atMs, so the "current height" can be re-derived locally without a
-        // network call, matching what the wlp curve says for that instant.
-        function interpolateTideHeight(predictions, atMs) {
-            if (!predictions || !predictions.length) return null;
-            for (var i = 0; i < predictions.length - 1; i++) {
-                var t0 = new Date(predictions[i].time).getTime();
-                var t1 = new Date(predictions[i + 1].time).getTime();
-                if (atMs >= t0 && atMs <= t1) {
-                    var frac = (t1 === t0) ? 0 : (atMs - t0) / (t1 - t0);
-                    return predictions[i].height + frac * (predictions[i + 1].height - predictions[i].height);
-                }
-            }
-            var firstT = new Date(predictions[0].time).getTime();
-            if (atMs < firstT) return predictions[0].height;
-            return predictions[predictions.length - 1].height;
-        }
-
-        // Trend from the slope of the bracketing curve segment — same 0.01m
-        // threshold the backend uses for the observed-data version.
-        function localTideTrend(predictions, atMs) {
-            if (!predictions || predictions.length < 2) return 'steady';
-            for (var i = 0; i < predictions.length - 1; i++) {
-                var t0 = new Date(predictions[i].time).getTime();
-                var t1 = new Date(predictions[i + 1].time).getTime();
-                if (atMs >= t0 && atMs <= t1) {
-                    var diff = predictions[i + 1].height - predictions[i].height;
-                    if (diff > 0.01) return 'rising';
-                    if (diff < -0.01) return 'falling';
-                    return 'steady';
-                }
-            }
-            return 'steady';
-        }
-
-        // Called whenever wind data refreshes (hour buttons, custom range,
-        // source toggle). Re-derives the tide display from the already-
-        // fetched prediction curve instead of hitting /api/tides again —
-        // unless the next low or next high has slipped into the past, in
-        // which case a real fetch is needed to get the new next event.
-        function refreshTideDisplay() {
-            if (!lastTide) { fetchTideData(); return; }
-            var nowMs = Date.now();
-            var lowPassed = lastTide.nextLow && new Date(lastTide.nextLow.time).getTime() <= nowMs;
-            var highPassed = lastTide.nextHigh && new Date(lastTide.nextHigh.time).getTime() <= nowMs;
-            if (lowPassed || highPassed) { fetchTideData(); return; }
-
-            var height = interpolateTideHeight(lastTide.predictions, nowMs);
-            if (height == null) { fetchTideData(); return; }
-            var trend = localTideTrend(lastTide.predictions, nowMs);
-
-            renderTideStats({ height: height, trend: trend, nextLow: lastTide.nextLow, nextHigh: lastTide.nextHigh });
-            renderTideChart({ predictions: lastTide.predictions, height: height });
-        }
-
         function fetchTideData() {
             fetch('/api/tides')
-                .then(function(resp) {
+              .then(function(resp) {
                     if (!resp.ok) throw new Error('HTTP ' + resp.status);
                     return resp.json();
                 })
@@ -1443,9 +1350,37 @@ const HTML_PAGE = `<!DOCTYPE html>
                 });
         }
 
-        function fetchUsageData() {        
+        function cachedFetch(fetchPath, delay) {
+            var cacheKey = 'cachedFetch:' + fetchPath;
+            var cached = null;
+            try {
+                cached = JSON.parse(localStorage.getItem(cacheKey));
+            } catch (e) {
+                cached = null;
+            }
+
+            if (cached && cached.fetchedAt && (Date.now() - cached.fetchedAt) < delay) {
+                return Promise.resolve(cached.data);
+            }
+
+            return fetch(fetchPath)
+                .then(function(resp) {
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    return resp.json();
+                })
+                .then(function(data) {
+                    try {
+                        localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), data: data }));
+                    } catch (e) {
+                        // localStorage unavailable/full; not critical, just skip caching.
+                    }
+                    return data;
+                });
+        }
+
+        function fetchUsageData() {
             document.getElementById('resetTimeLocal').textContent = new Date(0).toLocaleTimeString([], {timeStyle: 'short'});
-            fetch('/api/usage')
+            fetch('/api/usage') // cachedFetch('/api/usage', 5 * 60 * 1000) // if cached then skip next then
                 .then(function(resp) {
                     if (!resp.ok) throw new Error('HTTP ' + resp.status);
                     return resp.json();
@@ -1657,7 +1592,6 @@ const HTML_PAGE = `<!DOCTYPE html>
                 customRange = null;
                 document.getElementById('customRange').style.display = 'none';
                 fetchData();
-                refreshTideDisplay();
             });
         });
 
@@ -1694,7 +1628,6 @@ const HTML_PAGE = `<!DOCTYPE html>
             if (isNaN(from) || isNaN(to) || from >= to) { alert('Invalid range'); return; }
             customRange = { min: Math.floor(from.getTime() / 1000), max: Math.floor(to.getTime() / 1000) };
             fetchData();
-            refreshTideDisplay();
         });
 
         document.querySelectorAll('input[name="sourceMode"]').forEach(function(input) {
@@ -1703,14 +1636,27 @@ const HTML_PAGE = `<!DOCTYPE html>
                 if (!this.checked) return;
                 sourceMode = this.value;
                 fetchData();
-                refreshTideDisplay();
             });
+        });
+
+        document.getElementById('tideHeader').addEventListener('click', function() {
+            var body = document.getElementById('tideBody');
+            var expanding = body.style.display === 'none';
+            body.style.display = expanding ? '' : 'none';
+            this.classList.toggle('expanded', expanding);
+            if (expanding) fetchTideData();
+        });
+
+        document.getElementById('usageHeader').addEventListener('click', function() {
+            var body = document.getElementById('usageBody');
+            var expanding = body.style.display === 'none';
+            body.style.display = expanding ? '' : 'none';
+            this.classList.toggle('expanded', expanding);
+            if (expanding) fetchUsageData();
         });
 
         createCharts();
         fetchData();
-        fetchTideData();
-        fetchUsageData();
         //fetchForecastData();
     })();
     <\/script>
