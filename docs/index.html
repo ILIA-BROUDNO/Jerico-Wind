@@ -242,6 +242,7 @@
                 <div class="tide-stat">
                     <div class="label">Current Height</div>
                     <div class="value"><span id="tideHeight">--</span><span class="unit">m</span></div>
+                    <div class="sub"><span id="tideCurrentTime">&nbsp;</span></div>
                 </div>
                 <div class="tide-stat">
                     <div class="label">Trend</div>
@@ -693,6 +694,7 @@
 
         function renderTideStats(tide) {
             document.getElementById('tideHeight').textContent = tide.height.toFixed(1);
+            document.getElementById('tideCurrentTime').textContent = formatTideTime(new Date().toISOString());
 
             var trendEl = document.getElementById('tideTrend');
             trendEl.classList.remove('tide-trend-rising', 'tide-trend-falling', 'tide-trend-steady');
