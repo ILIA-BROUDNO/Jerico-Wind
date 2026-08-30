@@ -134,6 +134,17 @@
             margin: 0 0 15px;
             font-weight: 600;
         }
+        .forecast-section {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #1e2d3a;
+        }
+        .forecast-section h2 {
+            font-size: 1rem;
+            color: #4fc3f7;
+            margin: 0 0 15px;
+            font-weight: 600;
+        }
         .tide-summary {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -229,12 +240,6 @@
         <h2>Wind Direction</h2>
         <div class="chart-wrapper"><canvas id="directionChart"></canvas></div>
     </div>
-    <!-- 
-    // <div class="chart-container">
-    //     <h2>7 Day Forecast</h2>
-    //     <div class="chart-wrapper"><canvas id="forecastChart"></canvas></div>
-    // </div> 
-    -->
     <div class="tide-section">
         <h2 class="accordion-header" id="tideHeader">Tide — Point Atkinson<span class="accordion-icon">&#9656;</span></h2>
         <div class="accordion-body" id="tideBody" style="display:none;">
@@ -260,6 +265,13 @@
                 </div>
             </div>
             <div class="tide-chart-wrap"><canvas id="tideChart"></canvas></div>
+        </div>
+    </div>
+    <div class="forecast-section">
+        <h2 class="accordion-header" id="forecastHeader">Forecast — Spanish Banks<span class="accordion-icon">&#9656;</span></h2>
+        <div class="accordion-body" id="forecastBody" style="display:none;">
+            <!-- <div class="chart-wrapper"><canvas id="forecastChart"></canvas></div> -->
+            <iframe id="forecastIframe" style="width:100%; height:520px; border:0; border-radius:8px;"></iframe>
         </div>
     </div>
     <center>
@@ -970,9 +982,21 @@
             if (expanding) fetchTideData();
         });
 
+        document.getElementById('forecastHeader').addEventListener('click', function() {
+            var body = document.getElementById('forecastBody');
+            var expanding = body.style.display === 'none';
+            body.style.display = expanding ? '' : 'none';
+            this.classList.toggle('expanded', expanding);
+            if (expanding) {
+                var iframe = document.getElementById('forecastIframe');
+                if (!iframe.src) {
+                    iframe.src = 'https://igetwind.com/spot/north-america/canada/british-columbia/spanish-banks';
+                }
+            }
+        });
+
         createCharts();
         fetchData();
-        //fetchForecastData();
     })();
     </script>
 </body>
